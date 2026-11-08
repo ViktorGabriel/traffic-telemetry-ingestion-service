@@ -1,12 +1,64 @@
 services:
+  telemetry-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: traffic-telemetry-service
+    restart: unless-stopped
+    ports:
+      - "3333:3333"
+    environment:
+      - PORT=3333
+      - HOST=0.0.0.0
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_DATABASE=traffic_telemetry
+      - PG_USER=postgres
+      - PG_PASSWORD=postgres
+      - TELEMETRY_STREAM_NAME=traffic:telemetry:stream
+      - CONSUMER_GROUP_NAME=traffic-analytics-group
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
   redis:
     image: redis:7-alpine
     container_name: traffic-telemetry-redis
     ports:
       - "6379:6379"
     command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     volumes:
       - redis_data:/data
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: traffic-telemetry-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=traffic_telemetry
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d traffic_telemetry"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./src/infrastructure/database/migrations/001_init_telemetry_partitions.sql:/docker-entrypoint-initdb.d/001_init_telemetry_partitions.sql:ro
+
 volumes:
   redis_data:
+  pg_data:
