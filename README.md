@@ -1,45 +1,82 @@
-# Traffic Telemetry & Incident Ingestion Service
+# Traffic Telemetry & Incident Ingestion Microservice
 
-> Microsserviço de alta vazão para ingestão contínua de telemetria de tráfego, radares e detecção de incidentes viários em tempo real, construído com **Fastify**, **Redis Streams (ioredis)**, validação defensiva em **Zod** e arquitetura hexagonal / Clean Architecture.
+> Microsserviço de alta vazão para ingestão contínua de telemetria de tráfego, detecção de incidentes viários por janela deslizante (*sliding window*), broadcast via WebSocket e persistência colunar particionada em PostgreSQL. Construído com **Fastify**, **Redis Streams**, **PostgreSQL**, **TypeScript**, **Zod** e **Clean Architecture**.
 
-## 🏛️ Arquitetura & Visão Geral
+---
 
-O **Traffic Telemetry Ingestion Service** foi projetado para suportar cargas elevadas de leitura e telemetria geradas por sensores de fluxo viário e dispositivos IoT. Os dados recebidos passam por validação estrita de contratos antes de serem despachados de forma não bloqueante para um stream do Redis (`XADD`), permitindo que workers distribuídos processem métricas, anomalias e incidentes de forma assíncrona.
+## 🏛️ Arquitetura do Sistema
 
-### Principais Capacidades:
-- **Ingestão em Lote e Individual:** Suporte à ingestão de telemetrias pontuais ou em lote (`batch`) para redução de overhead HTTP.
-- **Buffer de Alta Performance:** Publicação de eventos em **Redis Streams** garantindo ordenação cronológica e desacoplamento do consumidor.
-- **Portas & Adaptadores (Hexagonal):** Porta de publicação (`TelemetryPublisherPort`) com implementações desacopladas para Redis Stream e mock em memória (`InMemoryTelemetryPublisher`) para testes rápidos.
-- **Validação Defensiva com Zod:** Rejeição de payloads corrompidos ou com campos ausentes em nível de schema antes de qualquer acesso I/O.
+O sistema é dividido em duas esteiras desacopladas para garantir que a ingestão HTTP opere com latência mínima sem gargalos no event loop:
+
+```
+[Sensores IoT / Radares]
+           │ (HTTP POST /telemetry/events em Batch)
+           ▼
+[Fastify Ingestion API] ──(Zod Fail-Fast)──► [Redis Stream: traffic:telemetry:stream]
+                                                        │
+                             ┌──────────────────────────┴──────────────────────────┐
+                             ▼ (XREADGROUP / Pipelined ACK)                        │
+               [TelemetryEventProcessor]                                           │
+                             │                                                     │
+                             ▼                                                     ▼
+              [SlidingWindowAnomalyDetector]                           [PostgreSQL Particionado]
+              ├── Excesso de Velocidade Consecutivo (>= 3x)            (Range por recorded_at + BRIN)
+              └── Perda de Sinal de Dispositivo (> 60s)
+                             │
+                  (IncidentDetected Event)
+                             ▼
+              [WebSocketIncidentBroadcaster]
+                             │
+                             ▼
+              [Painel de Operações ws://.../ws/operations]
+```
+
+### Principais Destaques de Engenharia:
+1. **Ingestão em Lote Não-Bloqueante:** Utiliza *Redis Pipelining* (`redis.pipeline()`) agrupando centenas de `XADD` em um único frame TCP socket, garantindo que o Node.js responda em $<5\text{ms}$ sem travar o event loop.
+2. **Detector de Anomalias por Janela Deslizante (*Sliding Window*):**
+   - **Excesso de Velocidade Consecutivo:** Monitora o histórico recente por `device_id`. Ao detectar leituras consecutivas acima do limite, dispara alerta de incidente classificado por risco (`MEDIUM`, `HIGH`, `CRITICAL`).
+   - **Detecção de Perda de Sinal (> 60s):** Varre dispositivos conhecidos e detecta ausência de sinal com mecanismo anti-spam de alertas.
+3. **Persistência Particionada em Séries Temporais:**
+   - PostgreSQL particionado por intervalo de tempo (`PARTITION BY RANGE (recorded_at)`).
+   - Índice compactado **BRIN** (*Block Range Index*) para escaneamento ultra-rápido de faixas temporais consumindo $<1\%$ do espaço de índices convencionais B-Tree.
+4. **Broadcast em Tempo Real:** Conexões ativas via WebSocket (`/ws/operations`) recebem notificações instantâneas de incidentes confirmados.
 
 ---
 
 ## 🛠️ Stack Tecnológica
 
-- **Runtime:** Node.js (>=20.0.0) com TypeScript 5.8
-- **Framework HTTP:** Fastify 5.x
-- **Mensageria / Streaming:** Redis Streams via `ioredis` 5.x
-- **Validação de Dados:** Zod 3.x
-- **Testes & Asserções:** Vitest 3.x
-- **Infraestrutura Local:** Docker & Docker Compose
+| Camada | Tecnologia |
+|---|---|
+| **Runtime & Linguagem** | Node.js 22 LTS / TypeScript 5.8 |
+| **Framework HTTP** | Fastify 5.x |
+| **Buffer / Mensageria** | Redis 7 (Streams com Consumer Groups & Pipelining) |
+| **Banco de Dados** | PostgreSQL 16 (Particionamento Temporal Declarativo + BRIN) |
+| **WebSockets** | `@fastify/websocket` |
+| **Validação de Contratos** | Zod 3.x |
+| **Suíte de Testes** | Vitest 3.x (TDD com mocks em memória) |
+| **Contêineres** | Docker (Multi-stage build com `dumb-init`) & Docker Compose |
 
 ---
 
-## 📁 Estrutura do Projeto
+## 📁 Estrutura do Projeto (Clean Architecture)
 
 ```text
 src/
-├── application/
-│   └── use-cases/            # Caso de uso: ingestão em lote / unitária
 ├── domain/
-│   └── telemetry/            # Schemas de evento de telemetria e portas (interfaces)
+│   ├── telemetry/            # Schemas Zod, tipos de eventos e portas de publicação/consumo
+│   └── incidents/            # Schemas de anomalias/incidentes e portas de persistência/broadcast
+├── application/
+│   ├── use-cases/            # Caso de uso de ingestão em batch
+│   └── services/             # Detector de janela deslizante e consumidor de telemetria
 ├── infrastructure/
-│   ├── redis/                # Conexão e publicação via Redis Streams
-│   └── repositories/         # Implementação em memória para testes
+│   ├── redis/                # Adaptadores de publicação e consumo em Redis Streams
+│   ├── database/             # Pool PostgreSQL, migrações de partição e repositórios
+│   ├── websocket/            # Broadcaster de incidentes em tempo real
+│   └── repositories/         # Mocks em memória para execução de testes unitários isolados
 ├── interfaces/
-│   └── http/                 # Controllers, Middlewares de erro e Rotas Fastify
-├── app.ts                    # Factory da aplicação Fastify
-└── server.ts                 # Bootstrap e inicialização do servidor
+│   └── http/                 # Controllers, rotas Fastify e tratamento global de erros
+├── app.ts                    # Factory e injeção de dependências do Fastify
+└── server.ts                 # Bootstrap e orquestração de encerramento gracioso (Graceful Shutdown)
 ```
 
 ---
@@ -47,39 +84,51 @@ src/
 ## 🚀 Como Executar
 
 ### Pré-requisitos
-- Node.js 20+
-- Docker e Docker Compose
+- Node.js 20+ ou Docker & Docker Compose
 
-### Instalação
+### 1. Inicializar Infraestrutura Completa (Redis + PostgreSQL)
 ```bash
+docker compose up -d redis postgres
+```
+
+### 2. Instalação e Execução Local
+```bash
+# Instalar dependências
 npm install
-```
 
-### Inicialização da Infraestrutura (Redis)
-```bash
-docker compose up -d
-```
-
-### Execução da Aplicação
-```bash
-# Modo de desenvolvimento com recarregamento a quente
+# Modo desenvolvimento com hot-reload
 npm run dev
 
 # Compilar para produção
 npm run build
 
-# Iniciar build compilado
+# Iniciar runtime compilado
 npm start
 ```
 
-### Testes Automatizados
+### 3. Execução Total via Docker Compose (App + Infra)
 ```bash
-# Executar todos os testes com Vitest
+docker compose up -d --build
+```
+
+---
+
+## 🧪 Testes Automatizados
+
+O projeto adota TDD rigoroso. Nenhuma dependência externa ativa (Redis ou PostgreSQL) é necessária para rodar os testes:
+
+```bash
+# Executar todos os testes
 npm test
 
-# Modo interativo de testes
+# Modo observador (watch)
 npm run test:watch
 ```
+
+A suíte inclui:
+- **Testes Unitários:** Validação defensiva com Zod, detecção de velocidade consecutiva, limites de batch e controle de timeouts.
+- **Teste de Pipeline com 50 Eventos Sequenciais:** Simula uma frota de veículos ao longo de 75 segundos, validando a persistência em banco, reconhecimento (`XACK`) no stream, detecção de infrator e identificação de veículo sem sinal.
+- **Testes de Integração HTTP:** Validação de endpoints `POST /telemetry/events` (202 Accepted, 400 Bad Request, 503 Service Unavailable).
 
 ---
 
