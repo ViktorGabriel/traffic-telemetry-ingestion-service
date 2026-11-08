@@ -1,12 +1,15 @@
 import fastify, { FastifyInstance } from "fastify";
+import fastifyWebsocket from "@fastify/websocket";
 import { TelemetryPublisherPort } from "./domain/telemetry/telemetry-publisher.port.js";
 import { IngestTelemetryBatchUseCase } from "./application/use-cases/ingest-telemetry-batch.use-case.js";
 import { TelemetryController } from "./interfaces/http/controllers/telemetry.controller.js";
 import { telemetryRoutes } from "./interfaces/http/routes/telemetry.routes.js";
 import { globalErrorHandler } from "./interfaces/http/middlewares/error-handler.js";
+import { WebSocketIncidentBroadcaster } from "./infrastructure/websocket/websocket-incident.broadcaster.js";
 
 export interface AppOptions {
   publisher: TelemetryPublisherPort;
+  broadcaster?: WebSocketIncidentBroadcaster;
   bodyLimitBytes?: number;
   logger?: boolean | object;
 }
@@ -31,12 +34,15 @@ export function buildApp(options: AppOptions): FastifyInstance {
   // Global Error Handler
   app.setErrorHandler(globalErrorHandler);
 
+  // Register WebSocket support
+  app.register(fastifyWebsocket);
+
   // Dependency Injection
   const ingestUseCase = new IngestTelemetryBatchUseCase(options.publisher);
   const controller = new TelemetryController(ingestUseCase);
 
   // Register Routes
-  app.register(telemetryRoutes, { controller });
+  app.register(telemetryRoutes, { controller, broadcaster: options.broadcaster });
 
   return app;
 }
