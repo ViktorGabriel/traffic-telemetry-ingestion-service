@@ -28,6 +28,7 @@ pnpm-debug.log*
 Thumbs.db
 
 # AI Tooling & Local Prompts (Never Commit to Public Repos)
+.antigravityrules
 .agents/
 .agent/
 .claude/
