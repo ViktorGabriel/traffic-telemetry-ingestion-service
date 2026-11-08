@@ -2,29 +2,70 @@ name: CI Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, develop ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, develop ]
 
 jobs:
   build-and-test:
+    name: Build, Typecheck & Test
     runs-on: ubuntu-latest
 
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: traffic_telemetry
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d traffic_telemetry"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      PORT: 3333
+      HOST: 0.0.0.0
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      PG_HOST: localhost
+      PG_PORT: 5432
+      PG_DATABASE: traffic_telemetry
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+
     steps:
-      - name: Checkout repository
+      - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20.x
+      - name: Setup Node.js 22 LTS
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: 'npm'
 
-      - name: Install dependencies
+      - name: Install Clean Dependencies
         run: npm ci
 
-      - name: Build TypeScript
-        run: npm run build
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
 
-      - name: Run Vitest Suite
-        run: npm test
+      - name: Run Test Suite with Coverage
+        run: npm run test:coverage
+
+      - name: Compile TypeScript Build
+        run: npm run build
